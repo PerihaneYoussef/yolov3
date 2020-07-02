@@ -126,6 +126,23 @@ def create_modules(module_defs, img_size, cfg):
         routs_binary[i] = True
     return module_list, routs_binary
 
+class Excitation_Network(nn.Module):
+  def __init__(self,channel_num,r):
+    super().__init__()
+    self.channel_num = channel_num
+    self.num_reduced_channels = channel_num//r
+    if self.num_reduced_channels == 0:
+      self.num_reduced_channels = 1
+    self.fc1 = nn.Linear(channel_num,self.num_reduced_channels)
+    self.fc2 = nn.Linear(self.num_reduced_channels,channel_num)
+    self.relu = nn.ReLU()
+    self.sigmoid = nn.Sigmoid()
+  def forward(self,x):
+    x = x.reshape(-1,self.channel_num)
+    x = self.relu(self.fc1(x))
+    x = self.sigmoid(self.fc2(x))
+    x = x.reshape(-1,self.channel_num,1,1)
+    return x
 
 class YOLOLayer(nn.Module):
     def __init__(self, anchors, nc, img_size, yolo_index, layers, stride):
@@ -141,7 +158,10 @@ class YOLOLayer(nn.Module):
         self.nx, self.ny, self.ng = 0, 0, 0  # initialize number of x, y gridpoints
         self.anchor_vec = self.anchors / self.stride
         self.anchor_wh = self.anchor_vec.view(1, self.na, 1, 1, 2)
-
+        self.excitations = []
+        self.dims = [255,255,255]
+        for i in range(3):
+          self.excitations.append(Excitation_Network(self.dims[i],r=4).cuda())
         if ONNX_EXPORT:
             self.training = False
             self.create_grids((img_size[1] // stride, img_size[0] // stride))  # number x, y grid points
@@ -160,7 +180,7 @@ class YOLOLayer(nn.Module):
             self.anchor_wh = self.anchor_wh.to(device)
 
     def forward(self, p, out):
-        ASFF = False  # https://arxiv.org/abs/1911.09516
+        ASFF = True  # https://arxiv.org/abs/1911.09516
         if ASFF:
             i, n = self.index, self.nl  # index in layers, number of layers
             p = out[self.layers[i]]
@@ -174,11 +194,16 @@ class YOLOLayer(nn.Module):
             # w = w / w.sum(1).unsqueeze(1)  # normalize across layer dimension
 
             # weighted ASFF sum
-            p = out[self.layers[i]][:, :-n] * w[:, i:i + 1]
+            level_atten = torch.mean(out[self.layers[i]][:, :-n],dim=(2,3)).reshape(out[self.layers[i]][:, :-n].shape[0],out[self.layers[i]][:, :-n].shape[1],1,1)
+            level_atten = self.excitations[i](level_atten)
+            p = out[self.layers[i]][:, :-n] * w[:, i:i + 1] * level_atten
             for j in range(n):
                 if j != i:
-                    p += w[:, j:j + 1] * \
-                         F.interpolate(out[self.layers[j]][:, :-n], size=[ny, nx], mode='bilinear', align_corners=False)
+                    resized_layer = F.interpolate(out[self.layers[j]][:, :-n], size=[ny, nx], mode='bilinear', align_corners=False)
+                    level_atten = torch.mean(resized_layer,dim=(2,3)).reshape(resized_layer.shape[0],resized_layer.shape[1],1,1)
+                    level_atten = self.excitations[j](level_atten)
+                    p += w[:, j:j + 1] * resized_layer * level_atten
+
 
         elif ONNX_EXPORT:
             bs = 1  # batch size
