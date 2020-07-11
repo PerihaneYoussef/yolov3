@@ -158,10 +158,17 @@ class YOLOLayer(nn.Module):
         self.nx, self.ny, self.ng = 0, 0, 0  # initialize number of x, y gridpoints
         self.anchor_vec = self.anchors / self.stride
         self.anchor_wh = self.anchor_vec.view(1, self.na, 1, 1, 2)
-        self.excitations = []
+
+        # Adding the new attention across depth dimension
+        excs = []
         self.dims = [255,255,255]
         for i in range(3):
-          self.excitations.append(Excitation_Network(self.dims[i],r=4).cuda())
+          excs.append(Excitation_Network(self.dims[i],r=4))
+        self.excitations = nn.Sequential(*excs) # Using Sequential as a way to store an array of networks accessing them using bracket notation later
+
+        # Adding 3x3 convolution method
+        self.asff_convs = nn.Sequential(nn.Conv2d(255,50,kernel_size=3,padding=1),nn.ReLU(),nn.Conv2d(50,3,kernel_size=1))
+
         if ONNX_EXPORT:
             self.training = False
             self.create_grids((img_size[1] // stride, img_size[0] // stride))  # number x, y grid points
@@ -184,13 +191,14 @@ class YOLOLayer(nn.Module):
         if ASFF:
             i, n = self.index, self.nl  # index in layers, number of layers
             p = out[self.layers[i]]
-            bs, _, ny, nx = p.shape  # bs, 255, 13, 13
+            t = self.asff_convs.forward(out[self.layers[i]][:, :-n])
+            bs, _, ny, nx = p.shape  # bs, 258, 13, 13
             if (self.nx, self.ny) != (nx, ny):
                 self.create_grids((nx, ny), p.device)
 
             # outputs and weights
             # w = F.softmax(p[:, -n:], 1)  # normalized weights
-            w = torch.sigmoid(p[:, -n:]) * (2 / n)  # sigmoid weights (faster)
+            w = torch.sigmoid(t) * (2 / n)  # sigmoid weights (faster)
             # w = w / w.sum(1).unsqueeze(1)  # normalize across layer dimension
 
             # weighted ASFF sum
